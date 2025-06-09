@@ -14,14 +14,14 @@ Organizational Units: Counts different org units involved based on assignee hist
 # Root Cause Classification:
 The system classifies tickets into these categories:
 
-Poor Requirement: Unclear, incomplete, or poorly defined requirements
-Technical Debt: Legacy code issues, outdated dependencies
-Unclear Scope: Scope creep, changing requirements
-Communication Gap: Team misunderstandings
-Resource Constraint: Insufficient time/people/tools
-External Dependency: Third-party blockers
-Testing Issue: Inadequate testing processes
-Design Flaw: Poor system/UX design
+- Poor Requirement or Interface: Unclear, incomplete, or poorly defined requirements
+- Technical Debt: Legacy code issues, outdated dependencies
+- Unclear Scope: Scope creep, changing requirements
+- Communication Gap: Team misunderstandings
+- Resource Constraint: Insufficient time/people/tools
+- External Dependency: Third-party blockers
+- Testing Issue: Inadequate testing processes
+- Design Flaw: Poor system/UX design
 
 # Advanced Analytics:
 
