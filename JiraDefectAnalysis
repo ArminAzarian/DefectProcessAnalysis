@@ -1,0 +1,314 @@
+import json
+import requests
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+import statistics
+from dataclasses import dataclass
+from enum import Enum
+import openai  # or your preferred LLM client
+import re
+
+class RootCause(Enum):
+    POOR_REQUIREMENT = "poor_requirement"
+    TECHNICAL_DEBT = "technical_debt"
+    UNCLEAR_SCOPE = "unclear_scope"
+    COMMUNICATION_GAP = "communication_gap"
+    RESOURCE_CONSTRAINT = "resource_constraint"
+    EXTERNAL_DEPENDENCY = "external_dependency"
+    TESTING_ISSUE = "testing_issue"
+    DESIGN_FLAW = "design_flaw"
+
+@dataclass
+class TicketMetrics:
+    ticket_id: str
+    first_response_time: float  # hours
+    total_close_time: float     # hours
+    iteration_count: int
+    comment_value_score: float  # 0-10 scale
+    org_units_count: int
+    root_cause: RootCause
+    confidence_score: float     # 0-1 for root cause classification
+
+class JIRATicketAnalyzer:
+    def __init__(self, jira_url: str, username: str, api_token: str, llm_client=None):
+        self.jira_url = jira_url.rstrip('/')
+        self.auth = (username, api_token)
+        self.llm_client = llm_client
+        self.headers = {'Accept': 'application/json'}
+    
+    def get_ticket_data(self, ticket_key: str) -> Dict:
+        """Fetch comprehensive ticket data from JIRA API"""
+        url = f"{self.jira_url}/rest/api/3/issue/{ticket_key}"
+        params = {
+            'expand': 'changelog,comments,worklog,transitions'
+        }
+        
+        response = requests.get(url, headers=self.headers, auth=self.auth, params=params)
+        response.raise_for_status()
+        return response.json()
+    
+    def calculate_first_response_time(self, ticket_data: Dict) -> float:
+        """Calculate time from creation to first response (hours)"""
+        created = datetime.fromisoformat(ticket_data['fields']['created'].replace('Z', '+00:00'))
+        
+        # Check comments for first response
+        comments = ticket_data.get('fields', {}).get('comment', {}).get('comments', [])
+        if not comments:
+            return 0.0
+        
+        first_comment = min(comments, key=lambda x: x['created'])
+        first_response = datetime.fromisoformat(first_comment['created'].replace('Z', '+00:00'))
+        
+        return (first_response - created).total_seconds() / 3600
+    
+    def calculate_close_time(self, ticket_data: Dict) -> float:
+        """Calculate total time to close ticket (hours)"""
+        created = datetime.fromisoformat(ticket_data['fields']['created'].replace('Z', '+00:00'))
+        
+        # Check if ticket is resolved/closed
+        resolution_date = ticket_data['fields'].get('resolutiondate')
+        if not resolution_date:
+            return 0.0  # Still open
+        
+        resolved = datetime.fromisoformat(resolution_date.replace('Z', '+00:00'))
+        return (resolved - created).total_seconds() / 3600
+    
+    def count_iterations(self, ticket_data: Dict) -> int:
+        """Count status transitions as iterations"""
+        changelog = ticket_data.get('changelog', {}).get('histories', [])
+        status_changes = 0
+        
+        for history in changelog:
+            for item in history.get('items', []):
+                if item.get('field') == 'status':
+                    status_changes += 1
+        
+        return max(1, status_changes)  # At least 1 iteration
+    
+    def analyze_comment_value(self, ticket_data: Dict) -> float:
+        """Use LLM to analyze value of comments (0-10 scale)"""
+        comments = ticket_data.get('fields', {}).get('comment', {}).get('comments', [])
+        if not comments or not self.llm_client:
+            return 5.0  # Default neutral score
+        
+        # Combine all comments
+        comment_text = "\n".join([c.get('body', '') for c in comments])
+        
+        prompt = f"""
+        Analyze the following JIRA ticket comments and rate their overall value on a scale of 0-10:
+        - 0-3: Comments are mostly noise, off-topic, or unhelpful
+        - 4-6: Comments provide some useful information but lack clarity or actionable insights
+        - 7-10: Comments are highly valuable, provide clear solutions, troubleshooting steps, or important context
+        
+        Comments:
+        {comment_text[:2000]}  # Limit for API
+        
+        Respond with only a number between 0 and 10.
+        """
+        
+        try:
+            response = self.llm_client.chat.completions.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=10
+            )
+            score = float(response.choices[0].message.content.strip())
+            return max(0, min(10, score))
+        except:
+            return 5.0  # Fallback score
+    
+    def count_org_units(self, ticket_data: Dict) -> int:
+        """Count unique organizational units involved"""
+        org_units = set()
+        
+        # Check assignee history
+        changelog = ticket_data.get('changelog', {}).get('histories', [])
+        for history in changelog:
+            for item in history.get('items', []):
+                if item.get('field') == 'assignee':
+                    # Extract org unit from user email or displayName
+                    assignee = item.get('toString', '')
+                    if '@' in assignee:
+                        domain_parts = assignee.split('@')[0].split('.')
+                        if len(domain_parts) > 1:
+                            org_units.add(domain_parts[0])  # Assume first part is org unit
+        
+        # Check current assignee
+        current_assignee = ticket_data.get('fields', {}).get('assignee')
+        if current_assignee:
+            email = current_assignee.get('emailAddress', '')
+            if '@' in email:
+                domain_parts = email.split('@')[0].split('.')
+                if len(domain_parts) > 1:
+                    org_units.add(domain_parts[0])
+        
+        # Check watchers and participants in comments
+        comments = ticket_data.get('fields', {}).get('comment', {}).get('comments', [])
+        for comment in comments:
+            author_email = comment.get('author', {}).get('emailAddress', '')
+            if '@' in author_email:
+                domain_parts = author_email.split('@')[0].split('.')
+                if len(domain_parts) > 1:
+                    org_units.add(domain_parts[0])
+        
+        return max(1, len(org_units))
+    
+    def classify_root_cause(self, ticket_data: Dict) -> Tuple[RootCause, float]:
+        """Use LLM to classify root cause with confidence score"""
+        if not self.llm_client:
+            return RootCause.POOR_REQUIREMENT, 0.5
+        
+        # Gather relevant text
+        summary = ticket_data.get('fields', {}).get('summary', '')
+        description = ticket_data.get('fields', {}).get('description', '')
+        comments = ticket_data.get('fields', {}).get('comment', {}).get('comments', [])
+        comment_text = "\n".join([c.get('body', '') for c in comments[:5]])  # First 5 comments
+        
+        prompt = f"""
+        Analyze this JIRA ticket and classify the root cause. Choose from:
+        1. poor_requirement: Unclear, incomplete, or poorly defined requirements
+        2. technical_debt: Legacy code issues, outdated dependencies, architectural problems
+        3. unclear_scope: Scope creep, unclear boundaries, changing requirements
+        4. communication_gap: Misunderstandings between teams, lack of communication
+        5. resource_constraint: Insufficient time, people, or tools
+        6. external_dependency: Waiting on third parties, external systems
+        7. testing_issue: Inadequate testing, test environment problems
+        8. design_flaw: Poor system design, user experience issues
+        
+        Ticket Summary: {summary}
+        Description: {description[:500]}
+        Comments: {comment_text[:500]}
+        
+        Respond in JSON format:
+        {{"root_cause": "category_name", "confidence": 0.8, "reasoning": "brief explanation"}}
+        """
+        
+        try:
+            response = self.llm_client.chat.completions.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200
+            )
+            
+            result = json.loads(response.choices[0].message.content.strip())
+            root_cause = RootCause(result['root_cause'])
+            confidence = float(result['confidence'])
+            
+            return root_cause, min(1.0, max(0.0, confidence))
+        except:
+            return RootCause.POOR_REQUIREMENT, 0.5
+    
+    def analyze_ticket(self, ticket_key: str) -> TicketMetrics:
+        """Perform comprehensive analysis of a single ticket"""
+        ticket_data = self.get_ticket_data(ticket_key)
+        
+        first_response_time = self.calculate_first_response_time(ticket_data)
+        close_time = self.calculate_close_time(ticket_data)
+        iterations = self.count_iterations(ticket_data)
+        comment_value = self.analyze_comment_value(ticket_data)
+        org_units = self.count_org_units(ticket_data)
+        root_cause, confidence = self.classify_root_cause(ticket_data)
+        
+        return TicketMetrics(
+            ticket_id=ticket_key,
+            first_response_time=first_response_time,
+            total_close_time=close_time,
+            iteration_count=iterations,
+            comment_value_score=comment_value,
+            org_units_count=org_units,
+            root_cause=root_cause,
+            confidence_score=confidence
+        )
+    
+    def analyze_multiple_tickets(self, ticket_keys: List[str]) -> List[TicketMetrics]:
+        """Analyze multiple tickets and return metrics"""
+        results = []
+        for ticket_key in ticket_keys:
+            try:
+                metrics = self.analyze_ticket(ticket_key)
+                results.append(metrics)
+                print(f"Analyzed {ticket_key}: {metrics.root_cause.value}")
+            except Exception as e:
+                print(f"Error analyzing {ticket_key}: {str(e)}")
+        
+        return results
+    
+    def generate_analytics_report(self, metrics_list: List[TicketMetrics]) -> Dict:
+        """Generate comprehensive analytics report"""
+        if not metrics_list:
+            return {}
+        
+        # Calculate averages
+        avg_first_response = statistics.mean([m.first_response_time for m in metrics_list])
+        avg_close_time = statistics.mean([m.total_close_time for m in metrics_list if m.total_close_time > 0])
+        avg_iterations = statistics.mean([m.iteration_count for m in metrics_list])
+        avg_comment_value = statistics.mean([m.comment_value_score for m in metrics_list])
+        avg_org_units = statistics.mean([m.org_units_count for m in metrics_list])
+        
+        # Root cause distribution
+        root_cause_dist = {}
+        for cause in RootCause:
+            count = sum(1 for m in metrics_list if m.root_cause == cause)
+            root_cause_dist[cause.value] = {
+                'count': count,
+                'percentage': (count / len(metrics_list)) * 100
+            }
+        
+        return {
+            'total_tickets_analyzed': len(metrics_list),
+            'averages': {
+                'first_response_time_hours': round(avg_first_response, 2),
+                'close_time_hours': round(avg_close_time, 2),
+                'iterations': round(avg_iterations, 2),
+                'comment_value_score': round(avg_comment_value, 2),
+                'org_units_involved': round(avg_org_units, 2)
+            },
+            'root_cause_distribution': root_cause_dist,
+            'recommendations': self.generate_recommendations(root_cause_dist, metrics_list)
+        }
+    
+    def generate_recommendations(self, root_cause_dist: Dict, metrics_list: List[TicketMetrics]) -> List[str]:
+        """Generate actionable recommendations based on analysis"""
+        recommendations = []
+        
+        # Check for dominant root causes
+        sorted_causes = sorted(root_cause_dist.items(), key=lambda x: x[1]['count'], reverse=True)
+        top_cause = sorted_causes[0][0] if sorted_causes else None
+        
+        if top_cause == 'poor_requirement' and root_cause_dist[top_cause]['percentage'] > 30:
+            recommendations.append("Focus on improving requirement gathering and documentation processes")
+        
+        if top_cause == 'communication_gap' and root_cause_dist[top_cause]['percentage'] > 25:
+            recommendations.append("Implement better cross-team communication protocols")
+        
+        # Check average metrics
+        avg_iterations = statistics.mean([m.iteration_count for m in metrics_list])
+        if avg_iterations > 5:
+            recommendations.append("High iteration count suggests need for better upfront planning")
+        
+        avg_org_units = statistics.mean([m.org_units_count for m in metrics_list])
+        if avg_org_units > 3:
+            recommendations.append("Consider reducing cross-organizational dependencies")
+        
+        return recommendations
+
+# Usage Example
+def main():
+    # Initialize the analyzer
+    analyzer = JIRATicketAnalyzer(
+        jira_url="https://your-company.atlassian.net",
+        username="your-email@company.com",
+        api_token="your-api-token",
+        llm_client=openai.OpenAI(api_key="your-openai-key")
+    )
+    
+    # Analyze tickets
+    ticket_keys = ["PROJ-123", "PROJ-124", "PROJ-125"]
+    metrics = analyzer.analyze_multiple_tickets(ticket_keys)
+    
+    # Generate report
+    report = analyzer.generate_analytics_report(metrics)
+    print(json.dumps(report, indent=2))
+
+if __name__ == "__main__":
+    main()
